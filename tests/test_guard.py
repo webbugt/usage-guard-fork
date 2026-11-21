@@ -1166,7 +1166,7 @@ def test_the_plugin_depends_only_on_hermes_public_surfaces(guard):
     hermes = {"agent", "hermes_cli", "plugins"}
     stdlib = {
         "__future__", "contextlib", "contextvars", "datetime", "fcntl", "json", "logging", "math",
-        "msvcrt", "os", "threading", "time", "types", "typing", "uuid",
+        "msvcrt", "os", "sqlite3", "threading", "time", "types", "typing", "uuid",
     }
     assert modules <= hermes | stdlib, sorted(modules - (hermes | stdlib))
     assert modules & hermes == hermes  # every Hermes surface it uses is the documented one
@@ -1174,3 +1174,135 @@ def test_the_plugin_depends_only_on_hermes_public_surfaces(guard):
     assert "plugins.plugin_storage" in source
     assert "agent.anthropic_credentials" not in source  # no credential route in the plugin
     assert "plugin-data/usage-guard" in source or "_CACHE_DIRNAME" in source
+
+
+def test_fable_limit_ignored_when_active_model_is_not_fable(guard):
+    """A model-scoped Fable limit (e.g. 92%) does NOT block non-Fable requests (e.g. Haiku)."""
+    windows = [
+        dict(label="Current session", used_percent=2.0, reset_at=RESET),
+        dict(label="Current week", used_percent=49.0, reset_at=RESET),
+        dict(label="Fable week", used_percent=92.0, reset_at=RESET),
+    ]
+    rec = make_record(windows=windows)
+    calls = []
+    with patch.object(guard, "_read_cache", return_value={"providers": {"anthropic": rec}}), \
+         patch.object(guard, "_spawn_poll_for_source"):
+        out = guard.gate_llm_execution(
+            lambda key, default: {"threshold_percent": 70.0}.get(key, default),
+            provider="anthropic", model="claude-haiku-5-5", api_mode="chat_completions",
+            request={}, next_call=lambda req: calls.append(req),
+        )
+    assert len(calls) == 1
+    assert not getattr(out, "usage_guard_blocked", False)
+
+
+def test_fable_limit_blocks_when_active_model_is_fable(guard):
+    """A model-scoped Fable limit DOES block requests when model is Fable."""
+    windows = [
+        dict(label="Current session", used_percent=2.0, reset_at=RESET),
+        dict(label="Current week", used_percent=49.0, reset_at=RESET),
+        dict(label="Fable week", used_percent=92.0, reset_at=RESET),
+    ]
+    rec = make_record(windows=windows)
+    calls = []
+    with patch.object(guard, "_read_cache", return_value={"providers": {"anthropic": rec}}), \
+         patch.object(guard, "_spawn_poll_for_source"):
+        out = guard.gate_llm_execution(
+            lambda key, default: {"threshold_percent": 70.0}.get(key, default),
+            provider="anthropic", model="claude-fable-3", api_mode="chat_completions",
+            request={}, next_call=lambda req: calls.append(req),
+        )
+    assert calls == []
+    assert getattr(out, "usage_guard_blocked", False) is True
+
+
+def test_unconfigured_model_refused_when_require_model_factor(guard):
+    """When require_model_factor is True, requesting a model not in model_token_factors is refused."""
+    calls = []
+    cfg = {
+        "require_model_factor": True,
+        "model_token_factors": {"claude-haiku-5-5": 0.15, "claude-sonnet-5": 1.0},
+    }
+    out = guard.gate_llm_execution(
+        lambda key, default: cfg.get(key, default),
+        provider="anthropic", model="unknown-exotic-model", api_mode="chat_completions",
+        request={}, next_call=lambda req: calls.append(req),
+    )
+    assert calls == []
+    assert getattr(out, "usage_guard_blocked", False) is True
+    choice = out.choices[0]
+    msg = getattr(choice, "delta", getattr(choice, "message", None))
+    assert msg is not None
+    assert "no token factor configured" in msg.content
+
+
+def test_configured_model_allowed_when_require_model_factor(guard):
+    """When require_model_factor is True, requesting a configured model is permitted to proceed."""
+    calls = []
+    cfg = {
+        "require_model_factor": True,
+        "model_token_factors": {"claude-haiku-5-5": 0.15, "claude-sonnet-5": 1.0},
+    }
+    rec = make_record(windows=[dict(label="Current session", used_percent=10.0, reset_at=RESET)])
+    with patch.object(guard, "_read_cache", return_value={"providers": {"anthropic": rec}}), \
+         patch.object(guard, "_spawn_poll_for_source"):
+        out = guard.gate_llm_execution(
+            lambda key, default: cfg.get(key, default),
+            provider="anthropic", model="claude-haiku-5-5", api_mode="chat_completions",
+            request={}, next_call=lambda req: calls.append(req),
+        )
+    assert len(calls) == 1
+    assert not getattr(out, "usage_guard_blocked", False)
+
+
+def test_profile_session_budget_blocks_when_exceeded(guard):
+    """When the profile exceeds profile_session_budget, requests are refused."""
+    calls = []
+    cfg = {
+        "profile_session_budget": 100_000.0,
+        "profile_name": "test-profile",
+    }
+    rec = make_record(windows=[dict(label="Current session", used_percent=10.0, reset_at=RESET)])
+    with patch.object(guard, "_read_cache", return_value={"providers": {"anthropic": rec}}), \
+         patch.object(guard, "_get_profile_window_usage", return_value=(150_000.0, 10)), \
+         patch.object(guard, "_spawn_poll_for_source"):
+        out = guard.gate_llm_execution(
+            lambda key, default: cfg.get(key, default),
+            provider="anthropic", model="claude-haiku-5-5", api_mode="chat_completions",
+            request={}, next_call=lambda req: calls.append(req),
+        )
+    assert calls == []
+    assert getattr(out, "usage_guard_blocked", False) is True
+    choice = out.choices[0]
+    msg = getattr(choice, "delta", getattr(choice, "message", None))
+    assert msg is not None
+    assert "reached its 5-hour session budget" in msg.content
+
+
+def test_profile_weekly_budget_blocks_when_exceeded(guard):
+    """When the profile exceeds profile_weekly_budget, requests are refused."""
+    calls = []
+    cfg = {
+        "profile_weekly_budget": 500_000.0,
+        "profile_name": "test-profile",
+    }
+    rec = make_record(windows=[
+        dict(label="Current session", used_percent=10.0, reset_at=RESET),
+        dict(label="Current week", used_percent=20.0, reset_at=RESET),
+    ])
+    with patch.object(guard, "_read_cache", return_value={"providers": {"anthropic": rec}}), \
+         patch.object(guard, "_get_profile_window_usage", return_value=(600_000.0, 50)), \
+         patch.object(guard, "_spawn_poll_for_source"):
+        out = guard.gate_llm_execution(
+            lambda key, default: cfg.get(key, default),
+            provider="anthropic", model="claude-haiku-5-5", api_mode="chat_completions",
+            request={}, next_call=lambda req: calls.append(req),
+        )
+    assert calls == []
+    assert getattr(out, "usage_guard_blocked", False) is True
+    choice = out.choices[0]
+    msg = getattr(choice, "delta", getattr(choice, "message", None))
+    assert msg is not None
+    assert "reached its weekly budget" in msg.content
+
+

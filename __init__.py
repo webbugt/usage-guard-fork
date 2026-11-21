@@ -148,6 +148,17 @@ DEFAULTS: dict[str, Any] = {
     # per account, not per plugin: on a machine with another reader, whoever read
     # last holds the fresher numbers. Empty (the default) disables borrowing.
     "hydrate_from_paths": [],
+    # Profile-level budget limits in Sonnet-equivalent units. None disables.
+    # 5h window: default 2,500,000 units (5% on Claude Ultra)
+    "profile_session_budget": None,
+    # 7d weekly window: default 3,750,000 units (10% on Claude Ultra)
+    "profile_weekly_budget": None,
+    # Dict of model identifier -> float factor (Sonnet = 1.0).
+    "model_token_factors": {},
+    # When True, any model requested that is not listed in model_token_factors is refused.
+    "require_model_factor": False,
+    # Profile name used to scope ledger queries (defaults to HERMES_HOME folder name)
+    "profile_name": None,
 }
 
 # Chat-facing refusals. Desktop and gateways render these as markdown.
@@ -675,15 +686,70 @@ def _discounted(record: Optional[dict[str, Any]], window: Any) -> bool:
             and (record or {}).get("extra_usage") is not True)
 
 
+def _get_active_model(model: Optional[str] = None) -> Optional[str]:
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        m = (cfg.get("model") or {}).get("default")
+        if isinstance(m, str) and m.strip():
+            return m.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _window_in_scope(window: dict[str, Any], model: Optional[str] = None) -> bool:
+    """Determine whether a usage window applies to the active model.
+
+    Session limits ('Current session', 'five_hour') and general weekly limits
+    ('Current week', 'seven_day', 'weekly_all') apply to all requests.
+    Model-scoped windows (e.g. 'Fable week', 'seven_day_fable') only apply
+    when the active model belongs to that specific model family.
+    """
+    if not isinstance(window, dict):
+        return False
+    label = str(window.get("label") or "").strip().lower()
+
+    # Session windows always apply
+    if "session" in label or "five_hour" in label:
+        return True
+
+    # General weekly windows always apply
+    if label in ("current week", "weekly_all", "seven_day", "week") or label.startswith("general"):
+        return True
+
+    # Fable-scoped window: only apply when the active model is fable
+    if "fable" in label:
+        return bool(model and "fable" in model.lower())
+
+    # Generic "<model> week" or "seven_day_<model>"
+    if label.endswith(" week"):
+        candidate = label[:-5].strip()
+        if candidate:
+            return bool(model and candidate in model.lower())
+    elif label.startswith("seven_day_"):
+        candidate = label[10:].strip()
+        if candidate:
+            return bool(model and candidate in model.lower())
+
+    return True
+
+
 def _exhausted_windows(
-    record: Optional[dict[str, Any]], threshold_percent: float, now: Optional[datetime] = None
+    record: Optional[dict[str, Any]], threshold_percent: float, now: Optional[datetime] = None,
+    model: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Windows at/over threshold (any reset state). Callers decide policy:
     `_decide_provider` denies on past resets before consulting this list."""
     now = now or _now_utc()
+    active_model = _get_active_model(model)
     hits: list[dict[str, Any]] = []
     for window in (record or {}).get("windows") or []:
         if not isinstance(window, dict):
+            continue
+        if not _window_in_scope(window, active_model):
             continue
         used = window.get("used_percent")
         if isinstance(used, bool) or not isinstance(used, (int, float)):
@@ -901,6 +967,74 @@ def _clean_levels(value: Any) -> Optional[list[float]]:
     return sorted(set(levels))
 
 
+def _clean_model_factors(val: Any) -> Optional[dict[str, float]]:
+    if val is None:
+        return {}
+    if not isinstance(val, dict):
+        return None
+    res = {}
+    for k, v in val.items():
+        if not isinstance(k, str) or not k.strip():
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            return None
+        res[k.strip().lower()] = float(v)
+    return res
+
+
+def _normalize_model_name(model: str) -> str:
+    m = model.strip().lower()
+    if "[" in m and m.endswith("]"):
+        m = m.split("[")[0].strip()
+    return m
+
+
+def _get_model_factor(model: Optional[str], factors: dict[str, float]) -> Optional[float]:
+    if not model or not isinstance(factors, dict):
+        return None
+    m = _normalize_model_name(model)
+    if m in factors:
+        return factors[m]
+    if model in factors:
+        return float(factors[model])
+    for k, v in factors.items():
+        norm_k = _normalize_model_name(k)
+        if norm_k == m or m.startswith(norm_k):
+            return float(v)
+    return None
+
+
+def _get_profile_window_usage(
+    profile: str,
+    since_ts: float,
+    factors: dict[str, float],
+    ledger_path: str = "/home/idv/.hermes/copilot-costs/ledger.db",
+) -> tuple[float, int]:
+    if not os.path.exists(ledger_path):
+        return 0.0, 0
+    try:
+        import sqlite3
+        with sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True, timeout=2.0) as con:
+            cur = con.cursor()
+            cur.execute(
+                "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens "
+                "FROM calls WHERE profile = ? AND ts >= ?",
+                (profile, since_ts),
+            )
+            rows = cur.fetchall()
+            total_units = 0.0
+            for row_model, inp, out, cread, cwrite in rows:
+                eff = (inp or 0) + (1.25 * (cwrite or 0)) + (0.10 * (cread or 0)) + (5.0 * (out or 0))
+                factor = _get_model_factor(row_model, factors)
+                if factor is None:
+                    factor = 1.0
+                total_units += eff * factor
+            return total_units, len(rows)
+    except Exception as exc:
+        LOG.warning("usage-guard: failed to query profile usage from %s: %s", ledger_path, exc)
+        return 0.0, 0
+
+
 def _read_settings(get_config: Callable[[str, Any], Any]) -> tuple[dict[str, Any], bool]:
     """Read and validate settings. Returns (settings, config_ok).
 
@@ -1023,6 +1157,42 @@ def _read_settings(get_config: Callable[[str, Any], Any]) -> tuple[dict[str, Any
             LOG.warning("usage-guard: setting %s is invalid (%r); guarded requests are refused until it is fixed in plugins.entries.usage-guard.settings", "max_tokens_near_wall", cap)
         else:
             settings["max_tokens_near_wall"] = cap
+
+        raw_factors = get_config("model_token_factors", DEFAULTS["model_token_factors"])
+        factors = _clean_model_factors(raw_factors)
+        if factors is None:
+            config_ok = False
+            LOG.warning("usage-guard: setting %s is invalid (%r); guarded requests are refused until it is fixed in plugins.entries.usage-guard.settings", "model_token_factors", raw_factors)
+        else:
+            settings["model_token_factors"] = factors
+
+        req_factor = get_config("require_model_factor", DEFAULTS["require_model_factor"])
+        if not isinstance(req_factor, bool):
+            config_ok = False
+            LOG.warning("usage-guard: setting %s is invalid (%r); guarded requests are refused until it is fixed in plugins.entries.usage-guard.settings", "require_model_factor", req_factor)
+        else:
+            settings["require_model_factor"] = req_factor
+
+        session_budget = get_config("profile_session_budget", DEFAULTS["profile_session_budget"])
+        if session_budget is not None and (isinstance(session_budget, bool) or not isinstance(session_budget, (int, float)) or session_budget < 0):
+            config_ok = False
+            LOG.warning("usage-guard: setting %s is invalid (%r); guarded requests are refused until it is fixed in plugins.entries.usage-guard.settings", "profile_session_budget", session_budget)
+        else:
+            settings["profile_session_budget"] = float(session_budget) if session_budget is not None else None
+
+        weekly_budget = get_config("profile_weekly_budget", DEFAULTS["profile_weekly_budget"])
+        if weekly_budget is not None and (isinstance(weekly_budget, bool) or not isinstance(weekly_budget, (int, float)) or weekly_budget < 0):
+            config_ok = False
+            LOG.warning("usage-guard: setting %s is invalid (%r); guarded requests are refused until it is fixed in plugins.entries.usage-guard.settings", "profile_weekly_budget", weekly_budget)
+        else:
+            settings["profile_weekly_budget"] = float(weekly_budget) if weekly_budget is not None else None
+
+        prof_name = get_config("profile_name", DEFAULTS["profile_name"])
+        if prof_name is not None and (not isinstance(prof_name, str) or not prof_name.strip()):
+            config_ok = False
+            LOG.warning("usage-guard: setting %s is invalid (%r)", "profile_name", prof_name)
+        else:
+            settings["profile_name"] = prof_name.strip() if isinstance(prof_name, str) else None
 
 
     except Exception:
@@ -1260,6 +1430,7 @@ def _reading_evidence(source_key: str) -> str:
 def _decide_provider(
     provider: str, source_key: str, settings: dict[str, Any], config_ok: bool,
     now: Optional[datetime] = None, spawn_poll: bool = True,
+    model: Optional[str] = None,
 ) -> _Decision:
     now = now or _now_utc()
     record = _read_cache().get("providers", {}).get(source_key)
@@ -1397,8 +1568,11 @@ def _decide_provider(
     # future reset; under it, the request passes. Refusing on the clock alone
     # locked out every agent whose endpoint stopped answering — the guard could
     # not distinguish "the window replenished" from "nobody told us anything".
+    active_model = _get_active_model(model)
     for window in record.get("windows") or []:
         if not isinstance(window, dict):
+            continue
+        if not _window_in_scope(window, active_model):
             continue
         used = window.get("used_percent")
         if isinstance(used, bool) or not isinstance(used, (int, float)):
@@ -1409,9 +1583,9 @@ def _decide_provider(
         if reset is not None and reset <= now:
             return _Decision(False, _NOTICE_UNAVAILABLE.format(provider=provider, reason=_describe_reason("unconfirmed reset")), "unconfirmed reset")
 
-    hits = _exhausted_windows(record, settings["threshold_percent"], now)
+    hits = _exhausted_windows(record, settings["threshold_percent"], now, model=active_model)
     if not hits:
-        if any(_discounted(record, w) for w in record.get("windows") or []):
+        if any(_discounted(record, w) for w in (record or {}).get("windows") or [] if _window_in_scope(w, active_model)):
             return _Decision(True, reason=_UNCONFIRMED_FULL_REASON)
         return _Decision(True)
     windows_txt = "; ".join(
@@ -1697,7 +1871,7 @@ def _gate_moa(kwargs: dict[str, Any], settings: dict[str, Any], config_ok: bool,
         if slot_provider not in settings["provider_keys"]:
             continue
         source_key = settings["provider_sources"].get(slot_provider, slot_provider)
-        decision = _decide_provider(slot_provider, source_key, settings, config_ok)
+        decision = _decide_provider(slot_provider, source_key, settings, config_ok, model=kwargs.get("model"))
         if not decision.allow:
             LOG.warning("usage-guard refused MoA preset=%s provider=%s model=%s: %s",
                         preset_name, slot_provider, kwargs.get("model"), decision.reason)
@@ -1750,6 +1924,89 @@ def _blocked_response(api_mode: Any, model: Any, text: str) -> Any:
     )
 
 
+def _check_profile_budgets(
+    provider: str,
+    source_key: str,
+    settings: dict[str, Any],
+    model: Optional[str] = None,
+) -> _Decision:
+    session_budget = settings.get("profile_session_budget")
+    weekly_budget = settings.get("profile_weekly_budget")
+    if not session_budget and not weekly_budget:
+        return _Decision(True)
+
+    profile = settings.get("profile_name")
+    if not profile:
+        home = os.environ.get("HERMES_HOME", "").strip()
+        profile = os.path.basename(home) if home else "singularity-matrix"
+
+    factors = settings.get("model_token_factors") or {}
+
+    record = _read_cache().get("providers", {}).get(source_key, {})
+    windows = record.get("windows") or []
+    now = _now_utc()
+
+    if session_budget:
+        session_window = None
+        for w in windows:
+            label = (w.get("label") or "").strip().lower()
+            if "session" in label or label == "five_hour":
+                session_window = w
+                break
+        reset_dt = _parse_ts(session_window.get("reset_at")) if session_window else None
+        if reset_dt and reset_dt > now:
+            window_start_ts = (reset_dt - timedelta(hours=5)).timestamp()
+            reset_str = reset_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            window_start_ts = (now - timedelta(hours=5)).timestamp()
+            reset_str = "the next reset"
+
+        used_units, _ = _get_profile_window_usage(profile, window_start_ts, factors)
+        if used_units >= session_budget:
+            reason = f"profile '{profile}' reached 5-hour session budget ({used_units:,.0f} / {session_budget:,.0f} units)"
+            notice = (
+                f"⏸ **usage-guard did not send this request** to `{provider}`.\n\n"
+                f"**Why:** Profile `{profile}` has reached its 5-hour session budget "
+                f"({used_units:,.0f} of {session_budget:,.0f} Sonnet-equivalent units) — resets at {reset_str}.\n\n"
+                f"**What to do**\n"
+                f"- Wait for the session reset at {reset_str}.\n"
+                f"- Or adjust `profile_session_budget` in `usage-guard.settings`.\n\n"
+                f"Nothing was sent, so no paid overage was spent."
+            )
+            return _Decision(False, notice=notice, reason=reason)
+
+    if weekly_budget:
+        weekly_window = None
+        for w in windows:
+            label = (w.get("label") or "").strip().lower()
+            if "current week" in label or "weekly" in label or label == "seven_day":
+                weekly_window = w
+                break
+        reset_dt = _parse_ts(weekly_window.get("reset_at")) if weekly_window else None
+        if reset_dt and reset_dt > now:
+            window_start_ts = (reset_dt - timedelta(days=7)).timestamp()
+            reset_str = reset_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            window_start_ts = (now - timedelta(days=7)).timestamp()
+            reset_str = "the next reset"
+
+        used_units, _ = _get_profile_window_usage(profile, window_start_ts, factors)
+        if used_units >= weekly_budget:
+            reason = f"profile '{profile}' reached weekly budget ({used_units:,.0f} / {weekly_budget:,.0f} units)"
+            notice = (
+                f"⏸ **usage-guard did not send this request** to `{provider}`.\n\n"
+                f"**Why:** Profile `{profile}` has reached its weekly budget "
+                f"({used_units:,.0f} of {weekly_budget:,.0f} Sonnet-equivalent units) — resets at {reset_str}.\n\n"
+                f"**What to do**\n"
+                f"- Wait for the weekly reset at {reset_str}.\n"
+                f"- Or adjust `profile_weekly_budget` in `usage-guard.settings`.\n\n"
+                f"Nothing was sent, so no paid overage was spent."
+            )
+            return _Decision(False, notice=notice, reason=reason)
+
+    return _Decision(True)
+
+
 # ── middleware ───────────────────────────────────────────────────────────────
 
 def gate_llm_execution(config_reader: Callable[[str, Any], Any], **kwargs: Any) -> Any:
@@ -1791,14 +2048,40 @@ def gate_llm_execution(config_reader: Callable[[str, Any], Any], **kwargs: Any) 
             _log_ungated_once(provider)
             return downstream(request)
         _log_gating_once(settings)
+
+        # Enforce model token factor if required
+        req_model = kwargs.get("model") or _get_active_model()
+        factors = settings.get("model_token_factors") or {}
+        factor = _get_model_factor(req_model, factors)
+        if settings.get("require_model_factor") and factor is None:
+            LOG.warning("usage-guard refused model=%s: no token factor configured", req_model)
+            notice = (
+                f"⏸ **usage-guard did not send this request** to `{provider}`.\n\n"
+                f"**Why:** Model `{req_model}` has no token factor configured under `model_token_factors`.\n\n"
+                f"**What to do**\n"
+                f"- Configure a token factor for `{req_model}` in `usage-guard.settings.model_token_factors`.\n"
+                f"- Or switch to an allowed model with `/model`.\n\n"
+                f"Nothing was sent, so no paid overage was spent."
+            )
+            return _blocked_response(kwargs.get("api_mode"), req_model,
+                                     _refusal_text(settings, config_ok, notice))
+
         source_key = settings["provider_sources"].get(provider, provider)
-        decision = _decide_provider(provider, source_key, settings, config_ok)
-        if decision.allow:
-            return downstream(request)
-        LOG.warning("usage-guard refused provider=%s model=%s: %s%s",
-                    provider, kwargs.get("model"), decision.reason, _reading_evidence(source_key))
-        return _blocked_response(kwargs.get("api_mode"), kwargs.get("model"),
-                                 _refusal_text(settings, config_ok, decision.notice))
+        decision = _decide_provider(provider, source_key, settings, config_ok, model=kwargs.get("model"))
+        if not decision.allow:
+            LOG.warning("usage-guard refused provider=%s model=%s: %s%s",
+                        provider, kwargs.get("model"), decision.reason, _reading_evidence(source_key))
+            return _blocked_response(kwargs.get("api_mode"), kwargs.get("model"),
+                                     _refusal_text(settings, config_ok, decision.notice))
+
+        # Check profile-level session and weekly token budgets
+        budget_decision = _check_profile_budgets(provider, source_key, settings, model=req_model)
+        if not budget_decision.allow:
+            LOG.warning("usage-guard refused profile budget: %s", budget_decision.reason)
+            return _blocked_response(kwargs.get("api_mode"), req_model,
+                                     _refusal_text(settings, config_ok, budget_decision.notice))
+
+        return downstream(request)
     except Exception:
         if dispatched:
             # Preserve provider errors/interruption and normal retry semantics.
@@ -1828,7 +2111,7 @@ _warned_level: "dict[tuple[str, str], float]" = {}
 _OUTPUT_BUDGET_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
 
 
-def _peak_percent(provider: str, settings: dict[str, Any]) -> Optional[tuple[float, dict[str, Any]]]:
+def _peak_percent(provider: str, settings: dict[str, Any], model: Optional[str] = None) -> Optional[tuple[float, dict[str, Any]]]:
     """Highest used_percent of the provider's cached snapshot and that window.
 
     Cache only: a stale or missing snapshot returns None, so neither the cap nor
@@ -1843,9 +2126,12 @@ def _peak_percent(provider: str, settings: dict[str, Any]) -> Optional[tuple[flo
     if age is None or age > max(settings["stale_grace_s"], settings["max_cache_age_s"]):
         return None
     record = _scaled_record(record, settings["source_scales"].get(source_key, "percent"))
+    active_model = _get_active_model(model)
     best: Optional[tuple[float, dict[str, Any]]] = None
     for window in (record or {}).get("windows") or []:
         if _discounted(record, window):
+            continue
+        if not _window_in_scope(window, active_model):
             continue
         used = window.get("used_percent") if isinstance(window, dict) else None
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
@@ -1883,7 +2169,8 @@ def shape_llm_request(config_reader: Callable[[str, Any], Any], **kwargs: Any) -
         cap = settings["max_tokens_near_wall"]
         if not config_ok or cap <= 0 or provider not in settings["provider_keys"]:
             return None
-        peak = _peak_percent(provider, settings)
+        req_model = kwargs.get("model") or (request.get("model") if isinstance(request, dict) else None)
+        peak = _peak_percent(provider, settings, model=req_model)
         if peak is None or not settings["near_wall_percent"] <= peak[0] < settings["threshold_percent"]:
             return None
         shaped = dict(request)
@@ -1970,17 +2257,19 @@ def _provider_status(provider: str, settings: dict[str, Any], config_ok: bool, n
     source_key = settings["provider_sources"].get(provider, provider)
     record = _read_cache().get("providers", {}).get(source_key)
     windows = _status_windows(record, settings, source_key)
-    peak = max((w["used_percent"] for w in windows if not w["ambiguous"]), default=None)
+    active_model = _get_active_model()
+    in_scope_windows = [w for w in windows if not w["ambiguous"] and _window_in_scope(w, active_model)]
+    peak = max((w["used_percent"] for w in in_scope_windows), default=None)
     if not config_ok:
         decision = _Decision(False, _NOTICE_CONFIG, "invalid settings")
     elif record is None:
         # No record at all: no request has gone to this provider yet. The first
         # one triggers a read and is decided on it, so "blocked" would be wrong.
         return {"provider": provider, "source": source_key, "state": "idle", "reason": "",
-                "notice": "", "peak_percent": None, "windows": [], "evidence_age_s": None}
+                "notice": "", "peak_percent": None, "windows": windows, "evidence_age_s": None}
     else:
         # spawn_poll=False: the view only reports, it never spends a read.
-        decision = _decide_provider(provider, source_key, settings, config_ok, now=now, spawn_poll=False)
+        decision = _decide_provider(provider, source_key, settings, config_ok, now=now, spawn_poll=False, model=active_model)
     over = peak is not None and peak >= settings["threshold_percent"]
     if not decision.allow and decision.reason == "no fresh snapshot" and windows and not over:
         # The last reading is old but under the limit. The guard reads again

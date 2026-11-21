@@ -74,3 +74,23 @@ config_schema:
     type: list
     default: []
     description: "Files to borrow a recent usage snapshot from (another reader's cache, same format as usage.json), consulted only when the guard's own reading is not fresh, instead of spending a usage request; [] disables"
+  profile_session_budget:
+    type: float
+    default: null
+    description: "Profile-level 5-hour session budget in Sonnet-equivalent units (5% on Ultra = 2,500,000); null disables"
+  profile_weekly_budget:
+    type: float
+    default: null
+    description: "Profile-level 7-day weekly budget in Sonnet-equivalent units (10% on Ultra = 3,750,000); null disables"
+  model_token_factors:
+    type: dict
+    default: {}
+    description: "Per-model weighting factor relative to Sonnet (1.0), e.g. 0.15 for Haiku, 4.0 for Opus"
+  require_model_factor:
+    type: bool
+    default: false
+    description: "When true, refuse requests for any model not explicitly configured in model_token_factors"
+  profile_name:
+    type: string
+    default: null
+    description: "Profile name used to scope ledger queries (defaults to HERMES_HOME folder name)"
